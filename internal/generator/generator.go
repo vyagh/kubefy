@@ -8,7 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Options holds configuration for the generator.
+// Options configures the manifest generation.
 type Options struct {
 	AppName     string
 	Namespace   string
@@ -16,32 +16,59 @@ type Options struct {
 	ServiceType string
 }
 
-// Generator holds the state for generating manifests.
+// Generator creates Kubernetes manifests from Dockerfile configuration.
 type Generator struct {
 	config  *parser.DockerfileConfig
 	options Options
 }
 
-// New creates a new Generator.
-func New(config *parser.DockerfileConfig, options Options) *Generator {
+// New creates a new Generator with the given config and options.
+func New(config *parser.DockerfileConfig, opts Options) *Generator {
 	return &Generator{
 		config:  config,
-		options: options,
+		options: opts,
 	}
 }
 
-// CreateDeployment generates the Deployment YAML.
+// CreateDeployment generates a Kubernetes Deployment manifest.
 func (g *Generator) CreateDeployment() ([]byte, error) {
-	matchLabels := map[string]string{"app": g.options.AppName}
-
-	var ports []PortMapping
-	for _, p := range g.config.Ports {
-		ports = append(ports, PortMapping{ContainerPort: p})
+	labels := map[string]string{
+		"app": g.options.AppName,
 	}
 
-	var envs []EnvVar
-	for _, e := range g.config.Env {
-		envs = append(envs, EnvVar{Name: e.Key, Value: e.Value})
+	// Handle images without tags (like scratch)
+	imageRef := g.config.Image
+	if g.config.Tag != "" {
+		imageRef = fmt.Sprintf("%s:%s", g.config.Image, g.config.Tag)
+	}
+
+	container := Container{
+		Name:  g.options.AppName,
+		Image: imageRef,
+	}
+
+	for _, port := range g.config.Ports {
+		container.Ports = append(container.Ports, PortMapping{
+			ContainerPort: port,
+		})
+	}
+
+	for _, envPair := range g.config.Env {
+		container.Env = append(container.Env, EnvVar{
+			Name:  envPair.Key,
+			Value: envPair.Value,
+		})
+	}
+
+	if len(g.config.Entrypoint) > 0 {
+		container.Command = g.config.Entrypoint
+	}
+	if len(g.config.Command) > 0 {
+		container.Args = g.config.Command
+	}
+
+	if g.config.WorkDir != "" {
+		container.WorkingDir = g.config.WorkDir
 	}
 
 	deployment := Deployment{
@@ -50,25 +77,19 @@ func (g *Generator) CreateDeployment() ([]byte, error) {
 		Metadata: Metadata{
 			Name:      g.options.AppName,
 			Namespace: g.options.Namespace,
-			Labels:    matchLabels,
+			Labels:    labels,
 		},
 		Spec: DeploymentSpec{
 			Replicas: g.options.Replicas,
-			Selector: LabelSelector{MatchLabels: matchLabels},
+			Selector: LabelSelector{
+				MatchLabels: labels,
+			},
 			Template: PodTemplateSpec{
-				Metadata: PodMetadata{Labels: matchLabels},
+				Metadata: PodMetadata{
+					Labels: labels,
+				},
 				Spec: PodSpec{
-					Containers: []Container{
-						{
-							Name:       g.options.AppName,
-							Image:      fmt.Sprintf("%s:%s", g.config.Image, g.config.Tag),
-							Ports:      ports,
-							Env:        envs,
-							Command:    g.config.Entrypoint,
-							Args:       g.config.Command,
-							WorkingDir: g.config.WorkDir,
-						},
-					},
+					Containers: []Container{container},
 				},
 			},
 		},
@@ -77,18 +98,27 @@ func (g *Generator) CreateDeployment() ([]byte, error) {
 	return yaml.Marshal(deployment)
 }
 
-// CreateService generates the Service YAML.
+// CreateService generates a Kubernetes Service manifest.
 func (g *Generator) CreateService() ([]byte, error) {
 	if len(g.config.Ports) == 0 {
-		return nil, nil
+		return nil, nil // No service needed if no ports exposed
 	}
 
-	var ports []ServicePort
-	for _, p := range g.config.Ports {
-		ports = append(ports, ServicePort{
-			Port:       p,
-			TargetPort: p,
-		})
+	labels := map[string]string{
+		"app": g.options.AppName,
+	}
+
+	var servicePorts []ServicePort
+	for i, port := range g.config.Ports {
+		sp := ServicePort{
+			Port:       port,
+			TargetPort: port,
+		}
+		// Name ports if there are multiple
+		if len(g.config.Ports) > 1 {
+			sp.Name = fmt.Sprintf("port-%d", i+1)
+		}
+		servicePorts = append(servicePorts, sp)
 	}
 
 	service := Service{
@@ -97,10 +127,11 @@ func (g *Generator) CreateService() ([]byte, error) {
 		Metadata: Metadata{
 			Name:      g.options.AppName,
 			Namespace: g.options.Namespace,
+			Labels:    labels,
 		},
 		Spec: ServiceSpec{
-			Selector: map[string]string{"app": g.options.AppName},
-			Ports:    ports,
+			Selector: labels,
+			Ports:    servicePorts,
 			Type:     g.options.ServiceType,
 		},
 	}
